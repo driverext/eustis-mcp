@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLIST_DIR="$HOME/Library/LaunchAgents"
 PLIST_PATH="$PLIST_DIR/com.eustis-mcp.bridge.plist"
 PYTHON_BIN="${PYTHON_BIN:-$(command -v python3)}"
-BRIDGE_DIR="${EUSTIS_BRIDGE_DIR:-/tmp/eustis-mcp-bridge}"
+BRIDGE_DIR="${EUSTIS_BRIDGE_DIR:-/tmp/eustis-mcp-${USER}}"
 
 mkdir -p "$PLIST_DIR"
 

@@ -67,7 +67,7 @@ The MCP client is sandboxed and cannot see the host VPN, but your normal termina
 
 In bridge mode:
 
-- the MCP server writes SSH and SCP jobs to `/tmp/eustis-mcp-bridge`
+- the MCP server writes SSH and SCP jobs to a private per-user bridge directory under the system temp folder
 - `bridge_agent.py` runs outside the sandbox on the same machine
 - the bridge worker executes the real SSH and SCP commands
 
@@ -94,7 +94,7 @@ Useful options:
 ./install.sh --dry-run
 ./install.sh --name eustis-ucf
 ./install.sh --config-path ~/.codex/config.toml
-./install.sh --bridge-dir /tmp/eustis-mcp-bridge
+./install.sh --bridge-dir /tmp/eustis-mcp-youruser
 ```
 
 Example generated TOML:
@@ -122,7 +122,7 @@ Common env vars:
 ```bash
 EUSTIS_NID=ab123456
 EUSTIS_USE_BRIDGE=1
-EUSTIS_BRIDGE_DIR=/tmp/eustis-mcp-bridge
+EUSTIS_BRIDGE_DIR=/tmp/eustis-mcp-youruser
 ```
 
 ### Claude Desktop
@@ -164,7 +164,7 @@ Start the bridge worker manually:
 Expected output:
 
 ```text
-Bridge root: /tmp/eustis-mcp-bridge
+Bridge root: /tmp/eustis-mcp-youruser
 Watching for requests. Press Ctrl+C to stop.
 ```
 
@@ -331,5 +331,6 @@ UCF's `UCF Students` group plus Microsoft web login did not prove reliable enoug
 ## Security Notes
 
 - This project does not store your Eustis password.
-- Bridge mode only works on the same machine because it uses a local filesystem queue.
+- Bridge mode only works on the same machine because it uses a local filesystem queue in a private per-user temp directory.
+- The bridge now validates directory ownership, file permissions, and a shared bridge token before executing queued jobs.
 - SSH keys are preferred over password prompts for MCP use.

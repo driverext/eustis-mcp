@@ -14,17 +14,21 @@ typically through the UCF Cisco VPN or an authenticated campus network.
 
 from __future__ import annotations
 
+import getpass
 import json
 import os
+import secrets
 import shutil
 import socket
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
 EUSTIS_HOST = os.environ.get("EUSTIS_HOST", "eustis3.eecs.ucf.edu")
@@ -34,7 +38,15 @@ MOBA_URL = "http://mobaxterm.mobatek.net/"
 HELP_EMAIL = "helpdesk@cecs.ucf.edu"
 DEFAULT_TIMEOUT_SECONDS = 30
 MAX_TIMEOUT_SECONDS = 300
-BRIDGE_ROOT = Path(os.environ.get("EUSTIS_BRIDGE_DIR", "/tmp/eustis-mcp-bridge")).expanduser()
+BRIDGE_DIR_MODE = 0o700
+BRIDGE_FILE_MODE = 0o600
+
+
+def default_bridge_root() -> Path:
+    return Path("/tmp") / f"eustis-mcp-{getpass.getuser()}"
+
+
+BRIDGE_ROOT = Path(os.environ.get("EUSTIS_BRIDGE_DIR", str(default_bridge_root()))).expanduser()
 
 
 def text_block(value: str) -> Dict[str, Any]:
@@ -114,19 +126,127 @@ def bridge_paths() -> Dict[str, Path]:
         "root": BRIDGE_ROOT,
         "requests": BRIDGE_ROOT / "requests",
         "responses": BRIDGE_ROOT / "responses",
+        "worker_pid": BRIDGE_ROOT / "worker.pid",
+        "token": BRIDGE_ROOT / "bridge.token",
     }
+
+
+def current_uid() -> Optional[int]:
+    return os.getuid() if hasattr(os, "getuid") else None
+
+
+def ensure_private_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True, mode=BRIDGE_DIR_MODE)
+    path = path.resolve()
+    info = path.lstat()
+    if stat.S_ISLNK(info.st_mode):
+        raise ValueError(f"Refusing to use symlink as bridge directory: {path}")
+    if not path.is_dir():
+        raise ValueError(f"Bridge path is not a directory: {path}")
+    uid = current_uid()
+    if uid is not None and info.st_uid != uid:
+        raise ValueError(f"Bridge directory is not owned by the current user: {path}")
+    if uid is not None:
+        os.chmod(path, BRIDGE_DIR_MODE)
+
+
+def ensure_private_file(path: Path) -> None:
+    info = path.lstat()
+    if stat.S_ISLNK(info.st_mode):
+        raise ValueError(f"Refusing to use symlink as bridge file: {path}")
+    uid = current_uid()
+    if uid is not None and info.st_uid != uid:
+        raise ValueError(f"Bridge file is not owned by the current user: {path}")
+    if uid is not None:
+        os.chmod(path, BRIDGE_FILE_MODE)
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    tmp_path = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+    fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, BRIDGE_FILE_MODE)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.replace(tmp_path, path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+
+
+def atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
+    atomic_write_text(path, json.dumps(payload))
+
+
+def read_json_file(path: Path) -> Dict[str, Any]:
+    ensure_private_file(path)
+    return json.loads(path.read_text())
+
+
+def ensure_secure_bridge_paths() -> Dict[str, Path]:
+    paths = bridge_paths()
+    ensure_private_dir(paths["root"])
+    ensure_private_dir(paths["requests"])
+    ensure_private_dir(paths["responses"])
+    return paths
+
+
+def load_bridge_token(create_if_missing: bool = False) -> Optional[str]:
+    env_token = os.environ.get("EUSTIS_BRIDGE_TOKEN", "").strip()
+    if env_token:
+        return env_token
+
+    paths = ensure_secure_bridge_paths()
+    token_path = paths["token"]
+    if token_path.exists():
+        ensure_private_file(token_path)
+        token = token_path.read_text().strip()
+        return token or None
+
+    if create_if_missing:
+        token = secrets.token_hex(32)
+        atomic_write_text(token_path, token)
+        ensure_private_file(token_path)
+        return token
+    return None
+
+
+def bridge_worker_running() -> bool:
+    try:
+        paths = ensure_secure_bridge_paths()
+    except ValueError:
+        return False
+
+    pid_path = paths["worker_pid"]
+    if not pid_path.exists():
+        return False
+    try:
+        ensure_private_file(pid_path)
+        pid = int(pid_path.read_text().strip())
+    except (ValueError, OSError):
+        return False
+
+    if pid <= 0:
+        return False
+    if hasattr(os, "kill"):
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+    return True
 
 
 def bridge_status_text() -> str:
     paths = bridge_paths()
     enabled = bridge_enabled()
-    worker_file = paths["root"] / "worker.pid"
+    token_exists = paths["token"].exists()
     lines = [
         f"Bridge enabled: {'yes' if enabled else 'no'}",
         f"Bridge directory: {paths['root']}",
         f"Requests dir exists: {'yes' if paths['requests'].exists() else 'no'}",
         f"Responses dir exists: {'yes' if paths['responses'].exists() else 'no'}",
-        f"Worker pid file exists: {'yes' if worker_file.exists() else 'no'}",
+        f"Worker running: {'yes' if bridge_worker_running() else 'no'}",
+        f"Bridge token exists: {'yes' if token_exists else 'no'}",
     ]
     if not enabled:
         lines.append("Set EUSTIS_USE_BRIDGE=1 to force SSH/SCP calls through the filesystem bridge.")
@@ -135,13 +255,10 @@ def bridge_status_text() -> str:
 
 
 def diagnose_runtime_mode(host: str, port: int, timeout_seconds: int) -> str:
-    paths = bridge_paths()
-    worker_file = paths["root"] / "worker.pid"
     lines = [f"Runtime diagnosis for {host}:{port}"]
 
     dns_ok = False
     tcp_ok = False
-    resolved_ip = ""
     try:
         resolved_ip = socket.gethostbyname(host)
         dns_ok = True
@@ -158,9 +275,11 @@ def diagnose_runtime_mode(host: str, port: int, timeout_seconds: int) -> str:
             lines.append(f"TCP connection: failed ({exc})")
 
     bridge_on = bridge_enabled()
-    worker_on = worker_file.exists()
+    worker_on = bridge_worker_running()
+    token_on = load_bridge_token(create_if_missing=False) is not None
     lines.append(f"Bridge env enabled: {'yes' if bridge_on else 'no'}")
     lines.append(f"Bridge worker available: {'yes' if worker_on else 'no'}")
+    lines.append(f"Bridge token available: {'yes' if token_on else 'no'}")
 
     if dns_ok and tcp_ok:
         lines.append("Conclusion: this runtime can reach Eustis directly.")
@@ -170,12 +289,12 @@ def diagnose_runtime_mode(host: str, port: int, timeout_seconds: int) -> str:
             lines.append("Recommended mode: direct SSH/SCP.")
         return "\n".join(lines)
 
-    if worker_on:
+    if worker_on and token_on:
         lines.append("Conclusion: this runtime does not have direct Eustis reachability, but a host-side bridge worker is available.")
         lines.append("Recommended mode: bridge SSH/SCP through the host terminal.")
         return "\n".join(lines)
 
-    lines.append("Conclusion: this runtime cannot directly reach Eustis, and no bridge worker is available.")
+    lines.append("Conclusion: this runtime cannot directly reach Eustis, and no trusted bridge worker is available.")
     lines.append("Recommended mode: either run the MCP in a non-sandboxed environment or start bridge_agent.py in a normal terminal.")
     return "\n".join(lines)
 
@@ -186,9 +305,13 @@ def run_bridge_command(
     command: List[str],
     timeout_seconds: int,
 ) -> str:
-    paths = bridge_paths()
-    paths["requests"].mkdir(parents=True, exist_ok=True)
-    paths["responses"].mkdir(parents=True, exist_ok=True)
+    paths = ensure_secure_bridge_paths()
+    token = load_bridge_token(create_if_missing=False)
+    if not token:
+        return (
+            f"{label} bridge is not ready\n\n"
+            "Start bridge_agent.py in a normal terminal first so it can create a bridge token."
+        )
 
     request_id = uuid.uuid4().hex
     request_path = paths["requests"] / f"{request_id}.json"
@@ -198,15 +321,18 @@ def run_bridge_command(
         "label": label,
         "command": command,
         "timeout_seconds": timeout_seconds,
+        "token": token,
     }
-    request_path.write_text(json.dumps(payload))
+    atomic_write_json(request_path, payload)
 
     deadline = time.time() + timeout_seconds + 5
     while time.time() < deadline:
         if response_path.exists():
-            response = json.loads(response_path.read_text())
+            response = read_json_file(response_path)
             response_path.unlink(missing_ok=True)
             request_path.unlink(missing_ok=True)
+            if response.get("token") != token:
+                return f"{label} bridge response failed token validation"
             return "\n".join(
                 [
                     f"{label} exit code: {response.get('returncode', 1)}",
@@ -300,7 +426,7 @@ def build_ssh_base(arguments: Dict[str, Any]) -> List[str]:
     return command + [f"{nid}@{host}"]
 
 
-def build_scp_base(arguments: Dict[str, Any]) -> List[str]:
+def build_scp_base(arguments: Dict[str, Any]) -> Tuple[List[str], str]:
     nid = resolve_nid(arguments)
     host = resolve_host(arguments)
     recursive = arguments.get("recursive", False)
@@ -346,10 +472,14 @@ def tool_get_quick_reference(_: Dict[str, Any]) -> Dict[str, Any]:
                 f"- MobaXTerm download: {MOBA_URL}",
                 "- SSH port: 22",
                 "- For direct MCP interaction, the host machine must already be on the VPN or an authenticated campus network",
-                f"- Optional sandbox bridge directory: {BRIDGE_ROOT}",
+                f"- Default bridge directory: {BRIDGE_ROOT}",
             ]
         )
     )
+
+
+def tool_bridge_status(_: Dict[str, Any]) -> Dict[str, Any]:
+    return success_text(bridge_status_text())
 
 
 def tool_check_eustis_access(arguments: Dict[str, Any]) -> Dict[str, Any]:
@@ -383,11 +513,7 @@ def tool_check_eustis_access(arguments: Dict[str, Any]) -> Dict[str, Any]:
         lines.append("This usually means the local machine is not on the UCF VPN or cannot reach the campus network path to Eustis.")
         return success_text("\n".join(lines))
 
-    if shutil.which("ssh") is None:
-        lines.append("ssh client: not found on this machine")
-    else:
-        lines.append("ssh client: available")
-
+    lines.append("ssh client: available" if shutil.which("ssh") else "ssh client: not found on this machine")
     lines.append("Network path looks good. Remote tool calls should work if SSH authentication is already set up.")
     lines.append("If password auth is your only option, open a manual SSH session first or configure SSH keys, because MCP tools run non-interactively by default.")
     return success_text("\n".join(lines))
@@ -618,10 +744,6 @@ def tool_list_remote_home(arguments: Dict[str, Any]) -> Dict[str, Any]:
     return tool_run_remote_command(list_arguments)
 
 
-def tool_bridge_status(_: Dict[str, Any]) -> Dict[str, Any]:
-    return success_text(bridge_status_text())
-
-
 @dataclass(frozen=True)
 class ToolDefinition:
     name: str
@@ -823,7 +945,7 @@ TOOLS: Dict[str, ToolDefinition] = {
 }
 
 
-SERVER_INFO = {"name": "eustis-mcp", "version": "0.2.0"}
+SERVER_INFO = {"name": "eustis-mcp", "version": "0.3.0"}
 
 
 def handle_initialize(message_id: Any, _: Dict[str, Any]) -> Dict[str, Any]:

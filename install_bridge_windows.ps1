@@ -1,7 +1,7 @@
 $ErrorActionPreference = "Stop"
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$BridgeDir = if ($env:EUSTIS_BRIDGE_DIR) { $env:EUSTIS_BRIDGE_DIR } else { "/tmp/eustis-mcp-bridge" }
+$BridgeDir = if ($env:EUSTIS_BRIDGE_DIR) { $env:EUSTIS_BRIDGE_DIR } else { Join-Path $env:TEMP ("eustis-mcp-" + $env:USERNAME) }
 $Python = if ($env:PYTHON_BIN) { $env:PYTHON_BIN } else { "python" }
 $TaskName = "eustis-mcp-bridge"
 $BridgeScript = Join-Path $ScriptDir "bridge_agent.py"
