@@ -6,6 +6,8 @@ This project is not affiliated with or maintained by UCF.
 
 It lets an MCP client run SSH commands on `eustis3.eecs.ucf.edu`, transfer files with SCP, and detect whether it should use direct network access or a local bridge worker.
 
+If you use this for coursework, you are responsible for verifying that it is allowed by your instructor and course policies before using it on class assignments.
+
 ## Before You Start
 
 - If you are not on UCF Wi-Fi or another UCF network, connect to the UCF VPN first with Cisco AnyConnect / Cisco Secure Client at `https://secure.vpn.ucf.edu`.
@@ -70,6 +72,12 @@ Useful environment variables:
 ```bash
 EUSTIS_NID=your_nid
 EUSTIS_USE_BRIDGE=1
+```
+
+Optional:
+
+```bash
+EUSTIS_BRIDGE_DIR=/tmp/eustis-mcp-youruser
 ```
 
 ### Codex Config
